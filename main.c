@@ -594,6 +594,8 @@ static void GetStream(u8* IPAddress, u8* StreamName)
 {
 	CycleCalibration();
 
+	fprintf(stderr, "GetStream IP[%s] [%s]\n", IPAddress, StreamName);
+
 	Network_t* CnC = NetworkOpen(0, 10000, IPAddress);
 	assert(CnC != NULL);
 
