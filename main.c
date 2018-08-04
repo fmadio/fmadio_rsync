@@ -23,8 +23,8 @@
 
 //-------------------------------------------------------------------------------------------
 
+// packet header from the capture system
 #define PACKETHEADER_FLAG_EOF			(1<<0)	// end of capture
-
 typedef struct
 {
 	u32                 SeqNo;              // chunk seq no
@@ -33,9 +33,9 @@ typedef struct
 	u8                 	Flag;           	// flags for the chunk 
 	u8					pad[3];
 
-} __attribute__((packed)) PacketHeader_t;
+} __attribute__((packed)) PktHeader_t;
 
-
+// commands to/from the capture system
 #define CMDHEADER_CMD_LIST          1       // list all the captures
 #define CMDHEADER_CMD_GET           2       // get a capture
 #define CMDHEADER_CMD_END          100 		// end of communications 
@@ -55,7 +55,6 @@ typedef struct
 
 
 // standard PCAP header 
-
 #define PCAPHEADER_MAGIC_NANO       0xa1b23c4d
 #define PCAPHEADER_MAGIC_USEC       0xa1b2c3d4
 #define PCAPHEADER_MAJOR            2
@@ -112,7 +111,7 @@ typedef struct Chunk_t
 	u32					SliceCnt;					// total number of recevied slices
 	u8					SliceList[64];				// list of recv slice ids 
 
-	PacketHeader_t		Header;						// header info from sender
+	PktHeader_t		Header;						// header info from sender
 	u8					Data[256*1024];				// up to 256KB for full chunk
 
 	struct Chunk_t*		NextFree;					// next free chunk 
@@ -174,6 +173,9 @@ static inline void Lock(u32* Lock)
 }
 static inline void Unlock(u32* Lock)
 {
+	// required to ensure correct memory ordering 
+	// of lock/unlock. a normal write should be sufficent 
+	// however the ordering of that write seems very relaxed..
 	if (__sync_bool_compare_and_swap(Lock, 1, 0) == false)
 	{
 		fprintf(stderr, "Unlock failed\n");
@@ -214,7 +216,7 @@ void ChunkFree(Chunk_t* C)
 
 //-------------------------------------------------------------------------------------------
 
-static Network_t* NetworkOpen(u32 CPUID, u32 PortBase)
+static Network_t* NetworkOpen(u32 CPUID, u32 PortBase, u8* IPAddress)
 {
 	Network_t* N = memalign2(4*1024,  sizeof(Network_t)); 
 	memset(N, 0, sizeof(Network_t));
@@ -229,7 +231,7 @@ static Network_t* NetworkOpen(u32 CPUID, u32 PortBase)
 
 	N->BindAddr.sin_family 		= AF_INET;
 	N->BindAddr.sin_port 		= htons(PortBase + CPUID);
-	N->BindAddr.sin_addr.s_addr = inet_addr("192.168.15.40");
+	N->BindAddr.sin_addr.s_addr = inet_addr(IPAddress);
 
 	//bind socket to port
 	int ret = connect(N->Sock, (struct sockaddr*)&N->BindAddr, sizeof(N->BindAddr));
@@ -316,7 +318,7 @@ void* RxThread(void* _User)
 		}
 
 		// get the packet header first
-		s32 HeaderLength 	= sizeof(PacketHeader_t);
+		s32 HeaderLength 	= sizeof(PktHeader_t);
 		u8* Header8			= (u8*)&C->Header;
 		if(!RecvSock(N->Sock, Header8, HeaderLength))
 		{
@@ -324,22 +326,6 @@ void* RxThread(void* _User)
 			fprintf(stderr, "recv failed %s\n", strerror(errno));
 			break;
 		}
-		/*
-		while (HeaderLength > 0)
-		{
-			int rlen = recv(N->Sock, Header8, HeaderLength, 0);
-			if (rlen > 0)
-			{
-				HeaderLength 	-= rlen;
-				Header8 		+= rlen;
-			}
-			if ((rlen < 0) && (errno != EAGAIN))
-			{
-				Exit = true;
-				break;
-			}
-		}
-		*/
 
 		// check for End of File marker
 		if (C->Header.Flag & PACKETHEADER_FLAG_EOF)
@@ -356,6 +342,7 @@ void* RxThread(void* _User)
 		assert(C->Header.SeqNo != 0);
 		C->SeqNo = C->Header.SeqNo;
 
+		// get the data payload
 		s32 BufferLength= C->Header.XferLength;
 		u8* Buffer8		= (u8*)C->Data;
 		if(!RecvSock(N->Sock, Buffer8, BufferLength))
@@ -368,31 +355,7 @@ void* RxThread(void* _User)
 		// stats 
 		N->TotalByte 	+= BufferLength;
 
-		/*
-		while (BufferLength > 0)
-		{
-			int rlen = recv(N->Sock, Buffer8, BufferLength, 0);
-			if (rlen <= 0)
-			{
-				if (errno != EAGAIN)
-				{
-					fprintf(stderr, "Worker: %i  Error %i %i %s\n", N->CPUID, rlen, errno, strerror(errno));
-					Exit = true;
-					break;
-				}
-			}
-			else
-			{
-				// iterate thought the raw buffer 
-				N->TotalByte 	+= rlen;
-
-				BufferLength	-= rlen;
-				Buffer8			+= rlen;	
-			}
-		}
-		*/
-
-		// mask out any meta data to make a pure PCAP 
+		// filter out and translate to PCAP format 
 		u8* Data8 = (u8*)C->Data;	
 		u8* Data8End = Data8 + C->Header.DataLength; 
 		while (Data8 < Data8End)
@@ -441,16 +404,16 @@ void* RxThread(void* _User)
 //-------------------------------------------------------------------------------------------
 // master control thread that takes blocks recevied by each thread and
 // re-assemables them in order 
-static void GetStreamData(void)
+static void GetStreamData(u8* IPAddress)
 {
 	CycleCalibration();
 
 	// init network connections	
 	Network_t* N[4];
-	N[0] = NetworkOpen(0, 10010);
-	N[1] = NetworkOpen(1, 10010);
-	N[2] = NetworkOpen(2, 10010);
-	N[3] = NetworkOpen(3, 10010);
+	N[0] = NetworkOpen(0, 10010, IPAddress);
+	N[1] = NetworkOpen(1, 10010, IPAddress);
+	N[2] = NetworkOpen(2, 10010, IPAddress);
+	N[3] = NetworkOpen(3, 10010, IPAddress);
 
 	// init the locks
 	s_ChunkFreeLock[0] = 1;
@@ -591,11 +554,11 @@ static void GetStreamData(void)
 
 //-------------------------------------------------------------------------------------------
 // list all streams on the device
-static void ListStreams(void)
+static void ListStreams(u8* IPAddress)
 {
 	CycleCalibration();
 
-	Network_t* CnC = NetworkOpen(0, 10000);
+	Network_t* CnC = NetworkOpen(0, 10000, IPAddress);
 	assert(CnC != NULL);
 
 
@@ -627,11 +590,11 @@ static void ListStreams(void)
 
 //-------------------------------------------------------------------------------------------
 // get a specific stream 
-static void GetStream(u8* StreamName)
+static void GetStream(u8* IPAddress, u8* StreamName)
 {
 	CycleCalibration();
 
-	Network_t* CnC = NetworkOpen(0, 10000);
+	Network_t* CnC = NetworkOpen(0, 10000, IPAddress);
 	assert(CnC != NULL);
 
 	CmdHeader_t Cmd;
@@ -657,7 +620,7 @@ static void GetStream(u8* StreamName)
 	}
 
 	// download it
-	GetStreamData();
+	GetStreamData(IPAddress);
 
 	// close CnC
 	shutdown(CnC->Sock, 0);
@@ -674,13 +637,14 @@ int main(int argc, char* argv[])
 		// set the download capture name
 		if (strcmp(argv[i], "--list") == 0)
 		{
-			ListStreams();
+			ListStreams(argv[i+1]);
+			i += 1;
 		}
 		// featch a file and output to stdout 
 		else if (strcmp(argv[i], "--get") == 0)
 		{
-			GetStream(argv[i + 1]);
-			i++;
+			GetStream(argv[i + 1], argv[i+2]);
+			i += 2;
 		}
 		else
 		{
