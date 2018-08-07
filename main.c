@@ -161,6 +161,8 @@ static volatile Chunk_t*	s_ChunkFree	= NULL;			// free chunk list
 
 static volatile u32			s_EOFSeqNo = 0;				// indicates SeqNo for EOF
 
+u32							g_Quiet = false;			// quiet mode 
+
 //-------------------------------------------------------------------------------------------
 // light weight mutexs
 static inline void Lock(u32* Lock)
@@ -233,12 +235,21 @@ static Network_t* NetworkOpen(u32 CPUID, u32 PortBase, u8* IPAddress)
 	N->BindAddr.sin_port 		= htons(PortBase + CPUID);
 	N->BindAddr.sin_addr.s_addr = inet_addr(IPAddress);
 
-	//bind socket to port
-	int ret = connect(N->Sock, (struct sockaddr*)&N->BindAddr, sizeof(N->BindAddr));
+	// retry connection a few times 
+	int ret = -1;
+	for (int r=0; r < 10; r++)
+	{
+		//bind socket to port
+		ret = connect(N->Sock, (struct sockaddr*)&N->BindAddr, sizeof(N->BindAddr));
+		if (ret >= 0) break;
+
+		// connection timed out
+		usleep(100e3);
+	}
 	if (ret < 0)
 	{
-		fprintf(stderr, "connect failed: %i %i : %s\n", ret, errno, strerror(errno)); 
-		return 0;
+		fprintf(stderr, "connect failed: %i %i : %s : %s:%i\n", ret, errno, strerror(errno), IPAddress, PortBase + CPUID); 
+		return NULL;
 	}
 
 	// set massive recvie buffer to minimize packet drops
@@ -291,7 +302,7 @@ static bool RecvSock(int Sock, u8* Buffer8, s32 BufferLength)
 void* RxThread(void* _User)
 {
 	Network_t* N = (Network_t*)_User;
-	fprintf(stderr, "[%i] RxThread starting\n", N->CPUID);
+	if (!g_Quiet) fprintf(stderr, "[%i] RxThread starting\n", N->CPUID);
 
 	// receive at maximum rate per thread 
 	bool Exit = false;
@@ -330,7 +341,7 @@ void* RxThread(void* _User)
 		// check for End of File marker
 		if (C->Header.Flag & PACKETHEADER_FLAG_EOF)
 		{
-			fprintf(stderr, "EOF Reached SeqNo: %i\n", C->Header.SeqNo);
+			if (!g_Quiet) fprintf(stderr, "EOF Reached SeqNo: %i\n", C->Header.SeqNo);
 			if (C->Header.SeqNo != 0)
 			{
 				s_EOFSeqNo		= C->Header.SeqNo;
@@ -396,7 +407,7 @@ void* RxThread(void* _User)
 		N->Queue.Put++;
 	}
 
-	fprintf(stderr, "[%i] RxThread exit\n", N->CPUID);
+	if (!g_Quiet) fprintf(stderr, "[%i] RxThread exit\n", N->CPUID);
 
 	return NULL;
 }
@@ -406,8 +417,6 @@ void* RxThread(void* _User)
 // re-assemables them in order 
 static void GetStreamData(u8* IPAddress)
 {
-	CycleCalibration();
-
 	// init network connections	
 	Network_t* N[4];
 	N[0] = NetworkOpen(0, 10010, IPAddress);
@@ -491,7 +500,9 @@ static void GetStreamData(u8* IPAddress)
 			double dT = tsc2ns(TSC - LastTSC) / 1e9;
 			double bps = dByte * 8.0 / dT;
 
-			fprintf(stderr, "Recved %8.3f GB %8.3f Gbps Queue (%3i) (%3i) (%3i) (%3i)  : SeqNo: %i %i\n", 
+			if (!g_Quiet) 
+			{
+				fprintf(stderr, "Recved %8.3f GB %8.3f Gbps Queue (%3i) (%3i) (%3i) (%3i)  : SeqNo: %i %i\n", 
 					TotalByte / 1e9, 
 					bps / 1e9,
 
@@ -501,7 +512,8 @@ static void GetStreamData(u8* IPAddress)
 					(u32)(N[3]->Queue.Put - N[3]->Queue.Get),
 
 					SeqNo, s_EOFSeqNo
-			); 
+				); 
+			}
 
 			LastByte 	= TotalByte;
 			LastTSC		= TSC;
@@ -512,7 +524,7 @@ static void GetStreamData(u8* IPAddress)
 		//       last processed so it will match s_EOFSeqNo
 		if ((s_EOFSeqNo != 0) && (SeqNo == s_EOFSeqNo))
 		{
-			fprintf(stderr, "Last Chunk Written\n");
+			if (!g_Quiet) fprintf(stderr, "Last Chunk Written\n");
 			g_Exit = true;
 			break;
 		}
@@ -531,6 +543,7 @@ static void GetStreamData(u8* IPAddress)
 			if (C->SeqNo == SeqNo)
 			{
 				TotalByte += C->Header.DataLength;
+				//fprintf(stderr, "%lli %i\n", TotalByte, C->Header.DataLength);
 
 				// next seq no to expect
 				SeqNo 		= C->SeqNo + 1;
@@ -594,7 +607,7 @@ static void GetStream(u8* IPAddress, u8* StreamName)
 {
 	CycleCalibration();
 
-	fprintf(stderr, "GetStream IP[%s] [%s]\n", IPAddress, StreamName);
+	if (!g_Quiet) fprintf(stderr, "GetStream IP[%s] [%s]\n", IPAddress, StreamName);
 
 	Network_t* CnC = NetworkOpen(0, 10000, IPAddress);
 	assert(CnC != NULL);
@@ -629,6 +642,19 @@ static void GetStream(u8* IPAddress, u8* StreamName)
 }
 
 //-------------------------------------------------------------------------------------------
+static void help(void)
+{
+	fprintf(stderr, "fmadio_rsync: high speed download interface\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "PCAP Output is written to stdout.\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "options:\n");
+	fprintf(stderr, "  -q                                        : Quiet mode\n");
+	fprintf(stderr, "  --list <fmadio device ip>                 : List all the captures on the device\n");
+	fprintf(stderr, "  --get  <fmadio device ip> <capture name>  : download the specified capture\n");
+}
+
+//-------------------------------------------------------------------------------------------
 
 int main(int argc, char* argv[])
 {
@@ -636,8 +662,18 @@ int main(int argc, char* argv[])
 
 	for (int i=1; i < argc; i++)
 	{
-		// set the download capture name
-		if (strcmp(argv[i], "--list") == 0)
+		if (strcmp(argv[i], "--help") == 0)
+		{
+			help();
+			return 0;
+		}
+		// quiet mode 
+		else if (strcmp(argv[i], "-q") == 0)
+		{
+			g_Quiet = true;	
+		}
+		// list all the captures 
+		else if (strcmp(argv[i], "--list") == 0)
 		{
 			ListStreams(argv[i+1]);
 			i += 1;

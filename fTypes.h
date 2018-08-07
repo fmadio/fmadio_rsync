@@ -482,7 +482,7 @@ static inline void  ns2str(u8* Str, u64 TS)
 
 static INLINE void CycleCalibration(void)
 {
-    fprintf(stderr, "calibrating...\n");
+    //fprintf(stderr, "calibrating...\n");
     u64 StartTS[16];
     u64 EndTS[16];
 
@@ -537,7 +537,7 @@ static INLINE void CycleCalibration(void)
 
     double CyclesSec = CyclesSum / CyclesCnt;
     double CyclesStd = sqrt(CyclesCnt *CyclesSum2 - CyclesSum *CyclesSum) / CyclesCnt;
-    fprintf(stderr, "Cycles/Sec %12.4f %.2f Ghz\n", CyclesSec, CyclesSec / CalibPeriodNS); 
+    //fprintf(stderr, "Cycles/Sec %12.4f %.2f Ghz\n", CyclesSec, CyclesSec / CalibPeriodNS); 
 
 	// set global
 	TSC2Nano = CalibPeriodNS / CyclesSec;
