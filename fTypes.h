@@ -489,6 +489,8 @@ static INLINE void CycleCalibration(void)
 	// parse /proc/cpuinfo to get the target rdtsc freq
 	// lazymans cpuid
 
+	/*
+
 	FILE * F = fopen("/proc/cpuinfo", "r");	
 	static char Buffer[1024];
 	fread(Buffer, 1024, 1, F);
@@ -501,23 +503,27 @@ static INLINE void CycleCalibration(void)
 	if (strstr(Buffer, "E5-2620 v3") != NULL) TargetFreq = 2.4e9;
 	if (strstr(Buffer, "E5-2620 v4") != NULL) TargetFreq = 2.1e9;
 	if (strstr(Buffer, "N3050")      != NULL) TargetFreq = 1.6e9;		// fmad1g 
+	*/
 
 	// calibrate exactly
     u64 CyclesSum   = 0;
     u64 CyclesSum2  = 0;
     u64 CyclesCnt   = 0;
+	double CalibPeriodNS = 1e6;
 	int i;
-    for (i=0; i < 5; i++)
+    for (i=0; i < 1; i++)
  	{
-        u64 NextTS = clock_ns() + 1e5;
+        u64 NextTS = clock_ns() + CalibPeriodNS;
         u64 StartTSC = rdtsc();
         while (clock_ns() < NextTS)
         {
+			/*
         	if ((rdtsc() - StartTSC) > 5 * TargetFreq)
 			{
         		fprintf(stderr, "%i : Calibration overflow: %lli : %lli\n", i, clock_ns(), NextTS);  
 				break;
 			}
+			*/
         }
         u64 EndTSC  = rdtsc();
 
@@ -526,19 +532,15 @@ static INLINE void CycleCalibration(void)
         CyclesSum2 += Cycles*Cycles;
         CyclesCnt++;
 
-		s64 CycleDelta = abs(Cycles - TargetFreq);
-        fprintf(stderr, "%i : %lli %16.4f cycles/nsec offset:%.3f Mhz\n", i, Cycles, Cycles / 1e9, CycleDelta / 1e6);
-
-		// if within 100mhz of target freq then continue
-		if (CycleDelta < 10e6) break;
+        //fprintf(stderr, "%i : %lli %16.4f cycles/nsec\n", i, Cycles, Cycles / 1e9);
     }
 
     double CyclesSec = CyclesSum / CyclesCnt;
     double CyclesStd = sqrt(CyclesCnt *CyclesSum2 - CyclesSum *CyclesSum) / CyclesCnt;
-    fprintf(stderr, "Cycles/Sec %12.4f Std:%8.f cycle std(%12.8f) Target:%.2f Ghz\n", CyclesSec, CyclesStd, CyclesStd / CyclesSec, TargetFreq / 1e9);
+    fprintf(stderr, "Cycles/Sec %12.4f %.2f Ghz\n", CyclesSec, CyclesSec / CalibPeriodNS); 
 
 	// set global
-	TSC2Nano = 1e9 / CyclesSec;
+	TSC2Nano = CalibPeriodNS / CyclesSec;
 }
 
 // convert pcap style sec : nsec format into pure nano
