@@ -509,7 +509,7 @@ static INLINE void CycleCalibration(void)
 	int i;
     for (i=0; i < 5; i++)
  	{
-        u64 NextTS = clock_ns() + 1e9;
+        u64 NextTS = clock_ns() + 1e5;
         u64 StartTSC = rdtsc();
         while (clock_ns() < NextTS)
         {
