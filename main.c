@@ -42,11 +42,16 @@ typedef struct
 #define CMDHEADER_CMD_OK           101 		// sucess 
 #define CMDHEADER_CMD_NG           102 		// failed 
 
+#define CMDHEADER_VERSION_1_0		0x10	// first release
+
 typedef struct
 {
+	u8					Version;			// cmd header version
 	u32                 Cmd;                // command to issue
 	u8                  StreamName[1024];	// stream info 
 	u64					StreamSize;
+
+	u32					Arg[1024];			// various arguments
 
 	u8                  FilterBPF[1024];    // run BPF filter
 	u8                  FilterRE[1024];     // run RegEx filter
@@ -106,12 +111,13 @@ typedef struct Chunk_t
 
 	u32					SeqNo;
 	u32					Bytes;						// number of bytes in this chunk
+	u64					PktCnt;						// number of packets in this chunk	
 
 	u32					SliceTotal;					// total number of slices
 	u32					SliceCnt;					// total number of recevied slices
 	u8					SliceList[64];				// list of recv slice ids 
 
-	PktHeader_t		Header;						// header info from sender
+	PktHeader_t			Header;						// header info from sender
 	u8					Data[256*1024];				// up to 256KB for full chunk
 
 	struct Chunk_t*		NextFree;					// next free chunk 
@@ -165,7 +171,7 @@ u32							g_Quiet = false;			// quiet mode
 
 //-------------------------------------------------------------------------------------------
 // light weight mutexs
-static inline void Lock(u32* Lock)
+static inline void Lock(volatile u32* Lock)
 {
 	while (__sync_bool_compare_and_swap(Lock, 0, 1) == false)
 	{
@@ -173,7 +179,7 @@ static inline void Lock(u32* Lock)
 		ndelay(100);
 	}
 }
-static inline void Unlock(u32* Lock)
+static inline void Unlock(volatile u32* Lock)
 {
 	// required to ensure correct memory ordering 
 	// of lock/unlock. a normal write should be sufficent 
@@ -189,7 +195,7 @@ Chunk_t* ChunkAlloc(void)
 	// get lock
 	Lock(&s_ChunkFreeLock[0]);
 
-	Chunk_t* C = (volatile Chunk_t*)s_ChunkFree;
+	volatile Chunk_t* C = (volatile Chunk_t*)s_ChunkFree;
 	if (C != NULL)
 	{
 		s_ChunkFree = C->NextFree;
@@ -201,7 +207,7 @@ Chunk_t* ChunkAlloc(void)
 	// release lock
 	Unlock(&s_ChunkFreeLock[0]);
 
-	return C;
+	return (Chunk_t*)C;
 }
 
 void ChunkFree(Chunk_t* C)
@@ -366,6 +372,9 @@ void* RxThread(void* _User)
 		// stats 
 		N->TotalByte 	+= BufferLength;
 
+		// packet count
+		u64 PktCnt 		= 0; 
+
 		// filter out and translate to PCAP format 
 		u8* Data8 = (u8*)C->Data;	
 		u8* Data8End = Data8 + C->Header.DataLength; 
@@ -392,10 +401,14 @@ void* RxThread(void* _User)
 			PPkt->LengthWire	= LengthWire;
 
 			Data8 += sizeof(PCAPPacket_t) + PPkt->LengthCapture;
+			PktCnt += 1;
 		}
 
 		N->TotalChunk++;
 		N->LastSeqNo	= C->Header.SeqNo;
+
+		// update packet count
+		C->PktCnt = PktCnt;
 
 		// push onto serialization queue
 		u32 Index = (N->Queue.Put & N->Queue.Mask); 
@@ -484,6 +497,7 @@ static void GetStreamData(u8* IPAddress)
 
 	u32 SeqNo 		= 1;			// SeqNo 0 is reserved
 	u64 TotalByte 	= 0;
+	u64 TotalPkt	= 0;
 
 	u64 LastByte 	= 0;
 	u64 LastTSC  	= 0;
@@ -543,6 +557,7 @@ static void GetStreamData(u8* IPAddress)
 			if (C->SeqNo == SeqNo)
 			{
 				TotalByte += C->Header.DataLength;
+				TotalPkt += C->PktCnt;
 				//fprintf(stderr, "%lli %i\n", TotalByte, C->Header.DataLength);
 
 				// next seq no to expect
@@ -574,10 +589,10 @@ static void ListStreams(u8* IPAddress)
 	Network_t* CnC = NetworkOpen(0, 10000, IPAddress);
 	assert(CnC != NULL);
 
-
 	CmdHeader_t Cmd;
 	memset(&Cmd, 0, sizeof(Cmd));
-	Cmd.Cmd	= CMDHEADER_CMD_LIST;         
+	Cmd.Version = CMDHEADER_VERSION_1_0;
+	Cmd.Cmd		= CMDHEADER_CMD_LIST;         
 
 	// send request
 	send(CnC->Sock, &Cmd, sizeof(Cmd), 0);
@@ -614,7 +629,8 @@ static void GetStream(u8* IPAddress, u8* StreamName)
 
 	CmdHeader_t Cmd;
 	memset(&Cmd, 0, sizeof(Cmd));
-	Cmd.Cmd	= CMDHEADER_CMD_GET;         
+	Cmd.Version = CMDHEADER_VERSION_1_0;
+	Cmd.Cmd		= CMDHEADER_CMD_GET;         
 	strncpy(Cmd.StreamName, StreamName, sizeof(Cmd.StreamName));
 
 	// send request
