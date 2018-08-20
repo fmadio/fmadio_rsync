@@ -502,7 +502,7 @@ static void GetStreamData(u8* IPAddress)
 	u64 LastByte 	= 0;
 	u64 LastTSC  	= 0;
 
-	u64 LastDataTSC = 0;			// last time data was processed
+	u64 LastDataTSC = rdtsc();			// last time data was processed
 
 	while (!g_Exit)
 	{
