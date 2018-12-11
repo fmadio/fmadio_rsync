@@ -169,6 +169,11 @@ static volatile u32			s_EOFSeqNo = 0;				// indicates SeqNo for EOF
 
 u32							g_Quiet = false;			// quiet mode 
 
+static u64					s_WorkerCPUTop[16];			// total cycles in worker threads
+static u64					s_WorkerCPUIO[16];			// total cycles in recv() tcp  
+static u64					s_WorkerCPUParse[16];		// total cycles in parsing the data 
+static u64					s_WorkerCPUStall[16];		// total cycles worker is stalled 
+
 //-------------------------------------------------------------------------------------------
 // light weight mutexs
 static inline void Lock(volatile u32* Lock)
@@ -317,12 +322,17 @@ void* RxThread(void* _User)
 		// global exit
 		if (g_Exit) break;
 
+		u64 TSC0 = rdtsc();
+
 		// dont have too many outstanding entries
 		// Put/Get are 64b and reset for each download
 		// its impossible to for this to wrap around 
 		if (N->Queue.Put  - N->Queue.Get >= 192) 
 		{
 			usleep(0);
+
+			s_WorkerCPUStall[N->CPUID] 	+= rdtsc() - TSC0;
+			s_WorkerCPUTop[N->CPUID] 	+= rdtsc() - TSC0;
 			continue;
 		}
 
@@ -331,6 +341,8 @@ void* RxThread(void* _User)
 		{
 			// no chunks free
 			usleep(0);
+			s_WorkerCPUStall[N->CPUID] 	+= rdtsc() - TSC0;
+			s_WorkerCPUTop[N->CPUID] 	+= rdtsc() - TSC0;
 			continue;
 		}
 
@@ -368,6 +380,8 @@ void* RxThread(void* _User)
 			fprintf(stderr, "recv data failed %s\n", strerror(errno));
 			break;
 		}
+		u64 TSC1 = rdtsc();
+		s_WorkerCPUIO[N->CPUID] += TSC1 - TSC0;
 
 		// stats 
 		N->TotalByte 	+= BufferLength;
@@ -418,6 +432,9 @@ void* RxThread(void* _User)
 		// kick it
 		sfence();
 		N->Queue.Put++;
+
+		s_WorkerCPUParse[N->CPUID] += rdtsc() - TSC1;
+		s_WorkerCPUTop	[N->CPUID] += rdtsc() - TSC0;
 	}
 
 	if (!g_Quiet) fprintf(stderr, "[%i] RxThread exit\n", N->CPUID);
@@ -504,21 +521,44 @@ static void GetStreamData(u8* IPAddress)
 
 	u64 LastDataTSC = rdtsc();			// last time data was processed
 
+	u64 CycleTotalTop 	= 0;
+	u64 CycleTotalIO  	= 0;
+
 	while (!g_Exit)
 	{
 		// print some stats
-		u64 TSC = rdtsc();
-		if (TSC > NextPrintTSC)
+		u64 TSC0 = rdtsc();
+		if (TSC0 > NextPrintTSC)
 		{
-			NextPrintTSC = TSC + ns2tsc(1e9);	
+			NextPrintTSC = TSC0 + ns2tsc(1e9);	
 
 			double dByte = TotalByte - LastByte;
-			double dT = tsc2ns(TSC - LastTSC) / 1e9;
+			double dT = tsc2ns(TSC0 - LastTSC) / 1e9;
 			double bps = dByte * 8.0 / dT;
+
+			// core cpu io write stalls
+			float CPUIO = CycleTotalIO * inverse(CycleTotalTop);
+
+			// worker cpu occupancy stats
+			u64 WorkerCPUTop = 0;
+			u64 WorkerCPUIO = 0;
+			u64 WorkerCPUParse = 0;
+			u64 WorkerCPUStall = 0;
+			for (int i=0; i < 4; i++)
+			{
+				WorkerCPUTop 	+= s_WorkerCPUTop[i]; 
+				WorkerCPUIO 	+= s_WorkerCPUIO[i]; 
+				WorkerCPUParse 	+= s_WorkerCPUParse[i]; 
+				WorkerCPUStall 	+= s_WorkerCPUStall[i]; 
+			}
+
+			float CPUWorkerIO	 = WorkerCPUIO * inverse(WorkerCPUTop);
+			float CPUWorkerParse = WorkerCPUParse * inverse(WorkerCPUTop);
+			float CPUWorkerStall = WorkerCPUStall * inverse(WorkerCPUTop);
 
 			if (!g_Quiet) 
 			{
-				fprintf(stderr, "Recved %8.3f GB %8.3f Gbps Queue (%3i) (%3i) (%3i) (%3i)  : SeqNo: %i %i\n", 
+				fprintf(stderr, "Recved %8.3f GB %8.3f Gbps Queue (%3i) (%3i) (%3i) (%3i)  | SeqNo: %i %i | CPU Core IO %.3f | CPU Worker IO:%.3f Parse:%.3f Stall:%.3f\n", 
 					TotalByte / 1e9, 
 					bps / 1e9,
 
@@ -527,12 +567,14 @@ static void GetStreamData(u8* IPAddress)
 					(u32)(N[2]->Queue.Put - N[2]->Queue.Get),
 					(u32)(N[3]->Queue.Put - N[3]->Queue.Get),
 
-					SeqNo, s_EOFSeqNo
+					SeqNo, s_EOFSeqNo,
+
+					CPUIO, CPUWorkerIO, CPUWorkerParse, CPUWorkerStall
 				); 
 			}
 
 			LastByte 	= TotalByte;
-			LastTSC		= TSC;
+			LastTSC		= TSC0;
 		}
 
 		// EOF ? 
@@ -551,13 +593,19 @@ static void GetStreamData(u8* IPAddress)
 			Queue_t* Q = &N[c]->Queue;
 
 			// nothing to process 
-			if (Q->Put == Q->Get) continue;
+			if (Q->Put == Q->Get)
+			{
+				ndelay(1000);
+				continue;
+			}
 
 			// check each queue for the next seq no
 			u32 Index 	= Q->Get & Q->Mask;
 			Chunk_t* C 	= Q->Entry[Index];
 			if (C->SeqNo == SeqNo)
 			{
+				u64 TSC2 = rdtsc();
+
 				TotalByte += C->Header.DataLength;
 				TotalPkt += C->PktCnt;
 				//fprintf(stderr, "%lli %i\n", TotalByte, C->Header.DataLength);
@@ -579,7 +627,9 @@ static void GetStreamData(u8* IPAddress)
 				Q->Get++;
 
 				// save last time somthing was processed
-				LastDataTSC  = rdtsc();
+				u64 TSC3 		= rdtsc();
+				LastDataTSC  	= TSC3;
+				CycleTotalIO 	+= TSC3 - TSC2;	
 			}
 		}
 
@@ -590,6 +640,9 @@ static void GetStreamData(u8* IPAddress)
 			g_Exit = true;
 			break;
 		}
+
+		u64 TSC1 = rdtsc();
+		CycleTotalTop += TSC1 - TSC0;
 	}
 
 	pthread_join(RxThread0, NULL);
@@ -634,17 +687,18 @@ static void GetStreamNULL(u64 MaxSize)
 		rnd = rnd * 214013 + 2531011; 
 	}
 
+
 	u64 StartTSC = rdtsc();
 	while (!g_Exit)
 	{
 		// print some stats
-		u64 TSC = rdtsc();
-		if (TSC > NextPrintTSC)
+		u64 TSC0 = rdtsc();
+		if (TSC0 > NextPrintTSC)
 		{
-			NextPrintTSC = TSC + ns2tsc(1e9);	
+			NextPrintTSC = TSC0 + ns2tsc(1e9);	
 
 			double dByte = TotalByte - LastByte;
-			double dT = tsc2ns(TSC - LastTSC) / 1e9;
+			double dT = tsc2ns(TSC0 - LastTSC) / 1e9;
 			double bps = dByte * 8.0 / dT;
 
 			if (!g_Quiet) 
@@ -656,7 +710,7 @@ static void GetStreamNULL(u64 MaxSize)
 			}
 
 			LastByte 	= TotalByte;
-			LastTSC		= TSC;
+			LastTSC		= TSC0;
 		}
 
 		// find next seq no 
@@ -664,10 +718,14 @@ static void GetStreamNULL(u64 MaxSize)
 			TotalByte 	+= kKB(256); 
 			TotalPkt 	+= 1; 
 
+
+
 			// write sequential data to disk 
 			int wlen = fwrite(WriteData, 1, kKB(256), stdout);
 			assert(wlen == kKB(256));
 		}
+
+
 
 		// exit condition
 		if (TotalByte > MaxSize) break;
