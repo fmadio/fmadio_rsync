@@ -581,6 +581,93 @@ static void GetStreamData(u8* IPAddress)
 }
 
 //-------------------------------------------------------------------------------------------
+// test the local disk sequential write performance 
+static void GetStreamNULL(u64 MaxSize)
+{
+	CycleCalibration();
+
+	// write pcap header
+	PCAPHeader_t	PCAPHeader;
+	PCAPHeader.Magic	= PCAPHEADER_MAGIC_NANO;
+	PCAPHeader.Major	= PCAPHEADER_MAJOR;
+	PCAPHeader.Minor	= PCAPHEADER_MINOR;
+	PCAPHeader.TimeZone	= 0; 
+	PCAPHeader.SigFlag	= 0; 
+	PCAPHeader.SnapLen	= 65535; 
+	PCAPHeader.Link		= PCAPHEADER_LINK_ETHERNET;
+	fwrite(&PCAPHeader, 1, sizeof(PCAPHeader), stdout);
+
+	u64 NextPrintTSC = 0;
+
+	u32 SeqNo 		= 1;			// SeqNo 0 is reserved
+	u64 TotalByte 	= 0;
+	u64 TotalPkt	= 0;
+
+	u64 LastByte 	= 0;
+	u64 LastTSC  	= 0;
+
+	// fill with random data, ensure 
+	// write compression is negated
+	u8* WriteData	= malloc(kKB(256));
+	u32 rnd = 0x12345678;
+	for (int i=0; i < kKB(256); i++)
+	{
+		WriteData[i] = (rnd >> 16)&0xFF;
+		rnd = rnd * 214013 + 2531011; 
+	}
+
+	u64 StartTSC = rdtsc();
+	while (!g_Exit)
+	{
+		// print some stats
+		u64 TSC = rdtsc();
+		if (TSC > NextPrintTSC)
+		{
+			NextPrintTSC = TSC + ns2tsc(1e9);	
+
+			double dByte = TotalByte - LastByte;
+			double dT = tsc2ns(TSC - LastTSC) / 1e9;
+			double bps = dByte * 8.0 / dT;
+
+			if (!g_Quiet) 
+			{
+				fprintf(stderr, "Recved %8.3f GB %8.3f Gbps\n",
+					TotalByte / 1e9, 
+					bps / 1e9
+				); 
+			}
+
+			LastByte 	= TotalByte;
+			LastTSC		= TSC;
+		}
+
+		// find next seq no 
+		{
+			TotalByte 	+= kKB(256); 
+			TotalPkt 	+= 1; 
+
+			// write sequential data to disk 
+			int wlen = fwrite(WriteData, 1, kKB(256), stdout);
+			assert(wlen == kKB(256));
+		}
+
+		// exit condition
+		if (TotalByte > MaxSize) break;
+		//if (TotalByte > kGB(1024) ) break;
+	}
+
+	// total average write speed
+	if (!g_Quiet) 
+	{
+		double dByte = TotalByte;
+		double dT = tsc2ns(rdtsc() - StartTSC) / 1e9;
+		double bps = dByte * 8.0 / dT;
+
+		fprintf(stderr, "Total  %8.3f GB %8.3f Gbps\n", TotalByte / 1e9, bps / 1e9); 
+	}
+}
+
+//-------------------------------------------------------------------------------------------
 // list all streams on the device
 static void ListStreams(u8* IPAddress)
 {
@@ -668,6 +755,7 @@ static void help(void)
 	fprintf(stderr, "  -q                                        : Quiet mode\n");
 	fprintf(stderr, "  --list <fmadio device ip>                 : List all the captures on the device\n");
 	fprintf(stderr, "  --get  <fmadio device ip> <capture name>  : download the specified capture\n");
+	fprintf(stderr, "  --get-null <output size>                  : null disk write test\n");
 }
 
 //-------------------------------------------------------------------------------------------
@@ -699,6 +787,14 @@ int main(int argc, char* argv[])
 		{
 			GetStream(argv[i + 1], argv[i+2]);
 			i += 2;
+		}
+		// local disk io perf testing 
+		else if (strcmp(argv[i], "--get-null") == 0)
+		{
+			u64 GBWrite = atoi(argv[i+1]);
+			fprintf(stderr, "Stream Null size %lli GB\n", GBWrite);
+			GetStreamNULL(kGB(GBWrite));
+			i += 1;
 		}
 		else
 		{
