@@ -502,6 +502,8 @@ static void GetStreamData(u8* IPAddress)
 	u64 LastByte 	= 0;
 	u64 LastTSC  	= 0;
 
+	u64 LastDataTSC = rdtsc();			// last time data was processed
+
 	while (!g_Exit)
 	{
 		// print some stats
@@ -565,12 +567,28 @@ static void GetStreamData(u8* IPAddress)
 
 				// write sequential data to disk 
 				int wlen = fwrite(C->Data, 1, C->Header.DataLength, stdout);
-				assert(wlen == C->Header.DataLength);
+				if (wlen != C->Header.DataLength)
+				{
+					fprintf(stderr, "ERROR: write to output failed wlen:%i errno:%i (%s)\n", wlen, errno, strerror(errno) );
+					g_Exit = true;
+					break;
+				}
 
 				// recycle the chunk
 				ChunkFree(C);
 				Q->Get++;
+
+				// save last time somthing was processed
+				LastDataTSC  = rdtsc();
 			}
+		}
+
+		// check for timeout on no data recevied
+		if (tsc2ns(rdtsc() - LastDataTSC) > 10e9)
+		{
+			fprintf(stderr, "ERROR: no data receveid in 10sec, exiting\n");
+			g_Exit = true;
+			break;
 		}
 	}
 
