@@ -660,11 +660,13 @@ static void GetStreamData(u8* IPAddress)
 
 //-------------------------------------------------------------------------------------------
 // test the local disk sequential write performance 
-static void TestStream(u64 FileLength)
+static void TestStream(u64 FileLength, u8* FilePath)
 {
 	CycleCalibration();
 
-	int fd  = open("/mnt/store1/tmp/ass.pcap", O_WRONLY| O_DIRECT | O_CREAT, S_IWUSR | S_IRUSR); 
+	printf("CreateTest File [%s]\n", FilePath);
+
+	int fd  = open(FilePath, O_WRONLY| O_DIRECT | O_CREAT, S_IWUSR | S_IRUSR); 
 	assert(fd > 0);
 
 	fAIO_t* AIO = fAIO_Open(fd);
@@ -914,7 +916,7 @@ int main(int argc, char* argv[])
 		{
 			u64 GBWrite = atof(argv[i+1]);
 			fprintf(stderr, "Stream Null size %.f GB\n", GBWrite/1e9);
-			TestStream(GBWrite);
+			TestStream(GBWrite, g_OutputFileName);
 			i += 1;
 		}
 		else
