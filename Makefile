@@ -1,5 +1,6 @@
 OBJS =
 OBJS += main.o
+OBJS += fAIO.o
 
 DEF =
 DEF += -O3

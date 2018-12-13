@@ -16,10 +16,13 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <linux/sched.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+
+#include "fAIO.h"
 
 //-------------------------------------------------------------------------------------------
 
@@ -168,6 +171,10 @@ static volatile Chunk_t*	s_ChunkFree	= NULL;			// free chunk list
 static volatile u32			s_EOFSeqNo = 0;				// indicates SeqNo for EOF
 
 u32							g_Quiet = false;			// quiet mode 
+
+bool						g_OutputStdout = false;		// output on stdout
+bool						g_OutputFile   = false;		// output to a file 
+u8							g_OutputFileName[256];		// where to write the file
 
 static u64					s_WorkerCPUTop[16];			// total cycles in worker threads
 static u64					s_WorkerCPUIO[16];			// total cycles in recv() tcp  
@@ -653,9 +660,23 @@ static void GetStreamData(u8* IPAddress)
 
 //-------------------------------------------------------------------------------------------
 // test the local disk sequential write performance 
-static void GetStreamNULL(u64 MaxSize)
+static void TestStream(u64 FileLength)
 {
 	CycleCalibration();
+
+	int fd  = open("/mnt/store1/tmp/ass.pcap", O_WRONLY| O_DIRECT | O_CREAT, S_IWUSR | S_IRUSR); 
+	assert(fd > 0);
+
+	fAIO_t* AIO = fAIO_Open(fd);
+	assert(AIO != NULL);
+
+	// truncate 
+	int ret = ftruncate64(fd, FileLength);
+	//int ret = ftruncate64(fd, 0);
+	if (ret < 0)
+	{
+		printf("failed to truncate file %i %i\n", ret, errno);
+	}
 
 	// write pcap header
 	PCAPHeader_t	PCAPHeader;
@@ -666,7 +687,8 @@ static void GetStreamNULL(u64 MaxSize)
 	PCAPHeader.SigFlag	= 0; 
 	PCAPHeader.SnapLen	= 65535; 
 	PCAPHeader.Link		= PCAPHEADER_LINK_ETHERNET;
-	fwrite(&PCAPHeader, 1, sizeof(PCAPHeader), stdout);
+	//fwrite(&PCAPHeader, 1, sizeof(PCAPHeader), Output);
+	//write(fd, &PCAPHeader, sizeof(PCAPHeader));
 
 	u64 NextPrintTSC = 0;
 
@@ -679,14 +701,14 @@ static void GetStreamNULL(u64 MaxSize)
 
 	// fill with random data, ensure 
 	// write compression is negated
-	u8* WriteData	= malloc(kKB(256));
+	u8* WriteDataUnalign	= malloc(kKB(256)*2);
+	u8* WriteData			= (u8*)( ((u64) WriteDataUnalign + 4095) & (~4095ULL) );	
 	u32 rnd = 0x12345678;
 	for (int i=0; i < kKB(256); i++)
 	{
 		WriteData[i] = (rnd >> 16)&0xFF;
 		rnd = rnd * 214013 + 2531011; 
 	}
-
 
 	u64 StartTSC = rdtsc();
 	while (!g_Exit)
@@ -712,25 +734,27 @@ static void GetStreamNULL(u64 MaxSize)
 			LastByte 	= TotalByte;
 			LastTSC		= TSC0;
 		}
+		fAIO_Update(AIO);
+		fAIO_WriteUpdate(AIO);
 
-		// find next seq no 
+		/*
+		int wlen = write(fd, WriteData, kKB(256));
+		assert(wlen == kKB(256));
+		TotalByte += wlen;
+		*/
+		if (fAIO_Write(AIO, WriteData, kKB(256) ) > 0)
 		{
 			TotalByte 	+= kKB(256); 
 			TotalPkt 	+= 1; 
-
-
-
-			// write sequential data to disk 
-			int wlen = fwrite(WriteData, 1, kKB(256), stdout);
-			assert(wlen == kKB(256));
 		}
 
-
-
 		// exit condition
-		if (TotalByte > MaxSize) break;
+		if (TotalByte >= FileLength) break;
 		//if (TotalByte > kGB(1024) ) break;
 	}
+
+	// wait for all writes to complete 
+	fAIO_WriteFlush(AIO);
 
 	// total average write speed
 	if (!g_Quiet) 
@@ -741,6 +765,11 @@ static void GetStreamNULL(u64 MaxSize)
 
 		fprintf(stderr, "Total  %8.3f GB %8.3f Gbps\n", TotalByte / 1e9, bps / 1e9); 
 	}
+	//munmap(Map, MapLength);
+	//fAIO_DumpHisto(AIO);
+
+	//fclose(Output);
+	close(fd);
 }
 
 //-------------------------------------------------------------------------------------------
@@ -829,9 +858,12 @@ static void help(void)
 	fprintf(stderr, "\n");
 	fprintf(stderr, "options:\n");
 	fprintf(stderr, "  -q                                        : Quiet mode\n");
+	fprintf(stderr, "  --output-stdout                           : write output to stdout\n");
+	fprintf(stderr, "  --output-disk <filename>                  : write output to disk specified at <filename>\n");
+
 	fprintf(stderr, "  --list <fmadio device ip>                 : List all the captures on the device\n");
 	fprintf(stderr, "  --get  <fmadio device ip> <capture name>  : download the specified capture\n");
-	fprintf(stderr, "  --get-null <output size>                  : null disk write test\n");
+	fprintf(stderr, "  --test <output size byte>                 : null disk write test, writes <bytes> output as fast as possible\n");
 }
 
 //-------------------------------------------------------------------------------------------
@@ -839,7 +871,6 @@ static void help(void)
 int main(int argc, char* argv[])
 {
 	fprintf(stderr, "fmadio rsync: %s\n", __DATE__);
-
 	for (int i=1; i < argc; i++)
 	{
 		if (strcmp(argv[i], "--help") == 0)
@@ -851,6 +882,20 @@ int main(int argc, char* argv[])
 		else if (strcmp(argv[i], "-q") == 0)
 		{
 			g_Quiet = true;	
+		}
+		// output stdout 
+		else if (strcmp(argv[i], "--output-stout") == 0)
+		{
+			g_OutputStdout = true;
+			fprintf(stderr, "OutputMode stdout\n");
+		}
+		// output stdout 
+		else if (strcmp(argv[i], "--output-file") == 0)
+		{
+			g_OutputFile = true;
+			strncpy(g_OutputFileName, argv[i+1], sizeof(g_OutputFileName) );
+			fprintf(stderr, "OutputMode File [%s]\n", g_OutputFileName);
+			i += 1;
 		}
 		// list all the captures 
 		else if (strcmp(argv[i], "--list") == 0)
@@ -865,11 +910,11 @@ int main(int argc, char* argv[])
 			i += 2;
 		}
 		// local disk io perf testing 
-		else if (strcmp(argv[i], "--get-null") == 0)
+		else if (strcmp(argv[i], "--test") == 0)
 		{
-			u64 GBWrite = atoi(argv[i+1]);
-			fprintf(stderr, "Stream Null size %lli GB\n", GBWrite);
-			GetStreamNULL(kGB(GBWrite));
+			u64 GBWrite = atof(argv[i+1]);
+			fprintf(stderr, "Stream Null size %.f GB\n", GBWrite/1e9);
+			TestStream(GBWrite);
 			i += 1;
 		}
 		else
