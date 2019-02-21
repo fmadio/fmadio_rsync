@@ -222,7 +222,7 @@ int fAIO_Update(fAIO_t* A)
 
 			if (e->res != O->Length)
 			{
-				printf("error: %i %i : %i %i : %p : %016llx FileOp:%x fd:%i (%s)\n", e->res, O->Length, i, r, O, O->Offset, O->FileOp, iocb->aio_fildes, strerror(-e->res) );
+				printf("error: %lli %lli : %i %i : %p : %016llx FileOp:%x fd:%i (%s)\n", e->res, O->Length, i, r, O, O->Offset, O->FileOp, iocb->aio_fildes, strerror(-e->res) );
 				/*
 				printf("%lli %lli %lli %lli\n", e->data, e->obj, e->res, e->res2);
 
