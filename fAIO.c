@@ -87,7 +87,6 @@ fAIO_t* fAIO_Open(int fd)
 	A->WritePos			= 0; 
 	A->WriteMax			= kKB(256);
 	A->WriteUnaligned	 	= malloc( A->WriteMax * 3);
-	A->Write				= (u8*) ( ((u64)A->WriteUnaligned + 4095) & (~4095ULL) ); 
 
 	// write queue
 	A->WriteQueuePut	= 0;
@@ -99,6 +98,9 @@ fAIO_t* fAIO_Open(int fd)
 		A->WriteQueueBuffer[i] = memalign(4096, kKB(256));
 		assert(A->WriteQueueBuffer[i] != NULL); 
 	}
+
+	// initialize the first wirte buffer 
+	A->Write		= A->WriteQueueBuffer[A->WriteQueuePut]; 
 
 	return A;
 }
@@ -206,11 +208,9 @@ int fAIO_Update(fAIO_t* A)
 			//printf("Complete %p, %016llx %08x %i %016llx : %i\n", O, O->Offset, O->State, O->FileOp, iocb->aio_offset, e->res);
 
 			// mark as complete
-
 			O->State		= AIO_OP_STATE_COMPLETE;
 
 			// update histogram
-
 			u64 dTS			= tsc2ns(TSC - O->KickTS);
 			u32 Index		= dTS / A->HistoBin;
 			Index			= (Index >= A->HistoMax) ? A->HistoMax - 1 : Index;
@@ -313,13 +313,13 @@ s32 fAIO_Write(fAIO_t* A, u8* Buffer, u32 Length)
 		A->WriteQueuePut++; 
 
 		A->WriteOffset += kKB(256);
-
+/*
 		s32 Remain = A->WritePos - kKB(256);
 		if (Remain > 0)
 		{
 			assert(false);
 		}
-
+*/
 		// set next write buffer
 		A->Write  	= A->WriteQueueBuffer[ A->WriteQueuePut & A->WriteQueueMsk ];
 		A->WritePos = 0;			

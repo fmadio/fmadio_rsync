@@ -172,9 +172,16 @@ static volatile u32			s_EOFSeqNo = 0;				// indicates SeqNo for EOF
 
 u32							g_Quiet = false;			// quiet mode 
 
-bool						g_OutputStdout = false;		// output on stdout
-bool						g_OutputFile   = false;		// output to a file 
-u8							g_OutputFileName[256];		// where to write the file
+static bool					s_OutputAIO		= false;	// output via AIO
+static bool					s_OutputStdout 	= true;		// output on stdout
+static u8					s_OutputFileName[256];		// where to write the file
+static int					s_OutputFD;					// output file descriptor
+static fAIO_t*				s_OutputAIOFD	= NULL;		// output AIO instance	
+
+static u8					s_OutputFileName[256];		// output file name 
+static u32					s_OutputBufferMax = 0;		// max bytes in output buffer 
+static u32					s_OutputBufferPos = 0;		// current bytes in output buffer 
+static u8*					s_OutputBuffer 		= NULL;	// 1MB output buffer
 
 static u64					s_WorkerCPUTop[16];			// total cycles in worker threads
 static u64					s_WorkerCPUIO[16];			// total cycles in recv() tcp  
@@ -450,10 +457,126 @@ void* RxThread(void* _User)
 }
 
 //-------------------------------------------------------------------------------------------
+// open file for output 
+static void DataOpen(u8* FileName) 
+{
+	strncpy(s_OutputFileName, FileName, sizeof(s_OutputFileName));	
+
+	s_OutputAIO 	= true;
+	s_OutputStdout 	= false;
+
+	s_OutputFD = open(s_OutputFileName, O_WRONLY| O_DIRECT | O_CREAT | O_TRUNC, S_IWUSR | S_IRUSR); 
+	if (s_OutputFD < 0)
+	{
+		fprintf(stderr, "failed to create file [%s] %i %s\n", FileName, errno, strerror(errno));
+		exit(-1);	
+	}
+
+	s_OutputAIOFD = fAIO_Open(s_OutputFD);
+	assert(s_OutputAIOFD != NULL);
+
+	// allocate output buffer
+	s_OutputBufferPos	= 0;
+	s_OutputBufferMax	= kMB(1);
+	s_OutputBuffer		= memalign(4096, s_OutputBufferMax);
+	assert(s_OutputBuffer != NULL);
+}
+
+//-------------------------------------------------------------------------------------------
+// write data out
+static void DataWrite(u8* Data, u32 Length)
+{
+	if (s_OutputStdout)
+	{
+		int wlen = fwrite(Data, 1, Length, stdout);
+		if (wlen != Length)
+		{
+			fprintf(stderr, "ERROR: write to output failed wlen:%i errno:%i (%s)\n", wlen, errno, strerror(errno) );
+			g_Exit = true;
+		}
+	}
+
+	if (s_OutputAIO)
+	{
+		// update internal AIO state	
+		fAIO_Update(s_OutputAIOFD);
+		fAIO_WriteUpdate(s_OutputAIOFD);
+
+		// buffer full
+		if (s_OutputBufferPos + Length > s_OutputBufferMax)
+		{
+			u32 BLength 	= s_OutputBufferMax- s_OutputBufferPos;
+			memcpy(s_OutputBuffer + s_OutputBufferPos, Data, BLength);
+
+			//int rlen = write(s_OutputFD, Out->Buffer, Out->BufferMax);
+
+			// write block
+			fAIO_Write(s_OutputAIOFD, s_OutputBuffer + 0 * kKB(256), kKB(256) );
+			fAIO_Write(s_OutputAIOFD, s_OutputBuffer + 1 * kKB(256), kKB(256) );
+			fAIO_Write(s_OutputAIOFD, s_OutputBuffer + 2 * kKB(256), kKB(256) );
+			fAIO_Write(s_OutputAIOFD, s_OutputBuffer + 3 * kKB(256), kKB(256) );
+
+			s_OutputBufferPos 	= 0;
+
+			// write remaining into next block
+			memcpy(s_OutputBuffer + s_OutputBufferPos, Data + BLength, Length - BLength);
+
+			s_OutputBufferPos += Length - BLength;
+		}
+		// append to current buffer
+		else
+		{
+			memcpy(s_OutputBuffer + s_OutputBufferPos, Data, Length);
+			s_OutputBufferPos += Length;
+		}
+
+		/*
+		// write block fd only
+		int rlen = write(s_OutputFD, Data, Length);
+		if (rlen != Length)
+		{
+			fprintf(stderr, "failed to write data: %i %s : length %i\n", errno, strerror(errno), Length);
+		}
+		*/
+	}
+}
+
+//-------------------------------------------------------------------------------------------
+// flush any remaining data 
+static void DataClose(void)
+{
+	if (s_OutputStdout)
+	{
+		fflush(stdout);
+	}
+	if (s_OutputAIO)
+	{
+		// wait for all writes to complete 
+		fAIO_WriteFlush(s_OutputAIOFD);
+
+		// shutdown AIO and file handle
+		close(s_OutputFD);
+
+		// need re-open for non POW2 aligned writes
+		s_OutputFD = open(s_OutputFileName, O_WRONLY | O_APPEND, S_IWUSR | S_IRUSR); 
+
+		// write remainder using normal IO
+		int wlen = write(s_OutputFD, s_OutputBuffer, s_OutputBufferPos);
+		if (wlen <= 0)
+		{
+			fprintf(stderr, "trailing write error %i %s\n", errno, strerror(errno));
+		}
+		close(s_OutputFD);
+	}
+}
+
+//-------------------------------------------------------------------------------------------
 // master control thread that takes blocks recevied by each thread and
 // re-assemables them in order 
 static void GetStreamData(u8* IPAddress)
 {
+	u64 TSStart = clock_ns();
+
 	// init network connections	
 	Network_t* N[4];
 	N[0] = NetworkOpen(0, 10010, IPAddress);
@@ -465,7 +588,6 @@ static void GetStreamData(u8* IPAddress)
 	s_ChunkFreeLock[0] = 1;
 	Unlock(&s_ChunkFreeLock[0]);
 
-
 	// write pcap header
 	PCAPHeader_t	PCAPHeader;
 	PCAPHeader.Magic	= PCAPHEADER_MAGIC_NANO;
@@ -475,7 +597,7 @@ static void GetStreamData(u8* IPAddress)
 	PCAPHeader.SigFlag	= 0; 
 	PCAPHeader.SnapLen	= 65535; 
 	PCAPHeader.Link		= PCAPHEADER_LINK_ETHERNET;
-	fwrite(&PCAPHeader, 1, sizeof(PCAPHeader), stdout);
+	DataWrite((u8*)&PCAPHeader, sizeof(PCAPHeader));
 
 	// allocate chunks
 	for (int i=0; i < 1024; i++)
@@ -620,14 +742,8 @@ static void GetStreamData(u8* IPAddress)
 				// next seq no to expect
 				SeqNo 		= C->SeqNo + 1;
 
-				// write sequential data to disk 
-				int wlen = fwrite(C->Data, 1, C->Header.DataLength, stdout);
-				if (wlen != C->Header.DataLength)
-				{
-					fprintf(stderr, "ERROR: write to output failed wlen:%i errno:%i (%s)\n", wlen, errno, strerror(errno) );
-					g_Exit = true;
-					break;
-				}
+				// write sequential block to output 
+				DataWrite(C->Data, C->Header.DataLength);
 
 				// recycle the chunk
 				ChunkFree(C);
@@ -652,10 +768,19 @@ static void GetStreamData(u8* IPAddress)
 		CycleTotalTop += TSC1 - TSC0;
 	}
 
+	DataClose();
+
 	pthread_join(RxThread0, NULL);
 	pthread_join(RxThread1, NULL);
 	pthread_join(RxThread2, NULL);
 	pthread_join(RxThread3, NULL);
+
+	u64 TSStop = clock_ns();
+
+	// print transfer stats
+	float dTS = (TSStop - TSStart) / 1e9;
+	float Bps = (TotalByte * 8.0) / dTS;
+	fprintf(stderr, "Took %.2f Sec  %.3f Gbps\n", dTS, Bps / 1e9); 
 }
 
 //-------------------------------------------------------------------------------------------
@@ -888,16 +1013,18 @@ int main(int argc, char* argv[])
 		// output stdout 
 		else if (strcmp(argv[i], "--output-stout") == 0)
 		{
-			g_OutputStdout = true;
+			s_OutputStdout = true;
 			fprintf(stderr, "OutputMode stdout\n");
 		}
 		// output stdout 
 		else if (strcmp(argv[i], "--output-file") == 0)
 		{
-			g_OutputFile = true;
-			strncpy(g_OutputFileName, argv[i+1], sizeof(g_OutputFileName) );
-			fprintf(stderr, "OutputMode File [%s]\n", g_OutputFileName);
+			strncpy(s_OutputFileName, argv[i+1], sizeof(s_OutputFileName) );
+			fprintf(stderr, "OutputMode File [%s]\n", s_OutputFileName);
 			i += 1;
+
+			// open a file for output via AIO
+			DataOpen(s_OutputFileName);
 		}
 		// list all the captures 
 		else if (strcmp(argv[i], "--list") == 0)
@@ -916,7 +1043,7 @@ int main(int argc, char* argv[])
 		{
 			u64 GBWrite = atof(argv[i+1]);
 			fprintf(stderr, "Stream Null size %.f GB\n", GBWrite/1e9);
-			TestStream(GBWrite, g_OutputFileName);
+			TestStream(GBWrite, s_OutputFileName);
 			i += 1;
 		}
 		else
