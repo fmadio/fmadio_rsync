@@ -556,4 +556,21 @@ static void * memalign2(int align, size_t size)
 	return a;
 }
 
+// lightweight lock 
+static inline u64 sync_lock(u32* Lock, u32 delay)
+{
+	u64 TSC0 = rdtsc();
+	while (!__sync_bool_compare_and_swap(Lock, 0, 1))
+	{
+		ndelay(delay);
+	}
+	return rdtsc() - TSC0;
+}
+static inline void sync_unlock(u32* Lock)
+{
+	Lock[0] = 0;
+	__asm__ volatile ("sfence");	
+}
+
+
 #endif

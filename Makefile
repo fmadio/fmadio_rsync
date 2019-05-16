@@ -1,6 +1,7 @@
 OBJS =
 OBJS += main.o
 OBJS += fAIO.o
+OBJS += fProfile.o
 
 DEF =
 DEF += -O3

@@ -26,6 +26,10 @@
 
 //-----------------------------------------------------------------------------------------------
 
+static void* fAIO_WriteThread(void* User);
+
+//-----------------------------------------------------------------------------------------------
+
 fAIO_t* fAIO_Open(int fd)
 {
 	fAIO_t* A = (fAIO_t*)malloc(sizeof(fAIO_t));
@@ -38,7 +42,6 @@ fAIO_t* fAIO_Open(int fd)
 	// non blocking
 
 	fcntl(A->afd, F_SETFL, fcntl(A->afd, F_GETFL, 0) | O_NONBLOCK);
-
 	if (io_setup(4*1024, &A->ctx))
 	{
 		printf("io_setup failed");
@@ -71,13 +74,13 @@ fAIO_t* fAIO_Open(int fd)
 	assert(A->IOList != NULL);
 	memset(A->IOList, 0, sizeof(iocb_t*)*A->IOListMax);
 
-	A->HistoBin		= 1e6;
-	A->HistoMax		= 1e6;
-	A->HistoRd		= (u32*)(malloc(A->HistoMax * sizeof(u32)));
+	A->HistoBin			= 1e6;
+	A->HistoMax			= 1e6;
+	A->HistoRd			= (u32*)(malloc(A->HistoMax * sizeof(u32)));
 	assert(A->HistoRd != NULL);
 	memset(A->HistoRd, 0, A->HistoMax * sizeof(u32));
 
-	A->HistoWr		= (u32*)(malloc(A->HistoMax * sizeof(u32)));
+	A->HistoWr			= (u32*)(malloc(A->HistoMax * sizeof(u32)));
 	assert(A->HistoWr != NULL);
 	memset(A->HistoWr, 0, A->HistoMax * sizeof(u32));
 
@@ -86,12 +89,12 @@ fAIO_t* fAIO_Open(int fd)
 	// allocate write buffer
 	A->WritePos			= 0; 
 	A->WriteMax			= kKB(256);
-	A->WriteUnaligned	 	= malloc( A->WriteMax * 3);
+	A->WriteUnaligned	= malloc( A->WriteMax * 3);
 
 	// write queue
 	A->WriteQueuePut	= 0;
 	A->WriteQueueGet	= 0;
-	A->WriteQueueMax	= 16;
+	A->WriteQueueMax	= 128;
 	A->WriteQueueMsk	= A->WriteQueueMax - 1;
 	for (int i=0; i < A->WriteQueueMax; i++)
 	{
@@ -100,44 +103,71 @@ fAIO_t* fAIO_Open(int fd)
 	}
 
 	// initialize the first wirte buffer 
-	A->Write		= A->WriteQueueBuffer[A->WriteQueuePut]; 
+	A->Write			= A->WriteQueueBuffer[A->WriteQueuePut]; 
+
+	// shutdown 
+	A->IsExit			= false;
+	A->WriteQueueLock	= 0;
+
+	// create write thread
+	pthread_create(&A->WriteThread, NULL, fAIO_WriteThread, (void*)A);
 
 	return A;
 }
 
 //-----------------------------------------------------------------------------------------------
 
+void fAIO_Close(fAIO_t* A)
+{
+	fprintf(stderr, "AIO Close\n");
+
+	// wait for all writes to complete 
+	fAIO_WriteFlush(A);
+
+	A->IsExit = true;
+	pthread_join(A->WriteThread, NULL); 
+
+	fprintf(stderr, "AIO Close Complete\n");
+}
+
+//-----------------------------------------------------------------------------------------------
+
 fAIOOp_t* fAIO_Queue(fAIO_t* A, int fd, u32 FileOp, void* Buffer, u64 Offset, u64 SectorSize)
 {
-	fAIOOp_t* Op			= A->AIOOpFree;
-	assert(Op != NULL);
+	fAIOOp_t* Op = NULL;
+	sync_lock(&A->WriteQueueLock, 100);
+	{
+		Op			= A->AIOOpFree;
+		assert(Op != NULL);
 
-	A->AIOOpFree		= A->AIOOpFree->NextFree;
-	assert(A->AIOOpFree != NULL);
+		A->AIOOpFree		= A->AIOOpFree->NextFree;
+		assert(A->AIOOpFree != NULL);
 
-	iocb_t* iocb		= &Op->iocb;
-	memset(iocb, 0, sizeof(iocb_t));
+		iocb_t* iocb		= &Op->iocb;
+		memset(iocb, 0, sizeof(iocb_t));
 
-	iocb->aio_fildes	= fd;
-	iocb->aio_lio_opcode= FileOp; //IOCB_CMD_PWRITE;
-	iocb->aio_reqprio	= 0;
-	iocb->aio_buf		= (u_int64_t)Buffer;
-	iocb->aio_nbytes	= SectorSize; 
-	iocb->aio_offset	= Offset;
-	iocb->aio_flags		= IOCB_FLAG_RESFD;
-	iocb->aio_resfd		= A->afd;
-	iocb->aio_data		= (u64)Op;
+		iocb->aio_fildes	= fd;
+		iocb->aio_lio_opcode= FileOp; //IOCB_CMD_PWRITE;
+		iocb->aio_reqprio	= 0;
+		iocb->aio_buf		= (u_int64_t)Buffer;
+		iocb->aio_nbytes	= SectorSize; 
+		iocb->aio_offset	= Offset;
+		iocb->aio_flags		= IOCB_FLAG_RESFD;
+		iocb->aio_resfd		= A->afd;
+		iocb->aio_data		= (u64)Op;
 
-	A->IOList[A->IOCount++]	= iocb;
-	A->IOPending++;
+		A->IOList[A->IOCount++]	= iocb;
+		A->IOPending++;
 
-	Op->KickTS			= rdtsc();
-	Op->Offset			= Offset;
-	Op->Length			= SectorSize;
+		Op->KickTS			= rdtsc();
+		Op->Offset			= Offset;
+		Op->Length			= SectorSize;
 
-	Op->State			= AIO_OP_STATE_PENDING;
-	Op->Buffer			= Buffer;
-	Op->FileOp			= FileOp;
+		Op->State			= AIO_OP_STATE_PENDING;
+		Op->Buffer			= Buffer;
+		Op->FileOp			= FileOp;
+	}
+	sync_unlock(&A->WriteQueueLock);	
 
 	return Op;
 }
@@ -146,6 +176,8 @@ fAIOOp_t* fAIO_Queue(fAIO_t* A, int fd, u32 FileOp, void* Buffer, u64 Offset, u6
 
 int  fAIO_Kick(fAIO_t* A)
 {
+	sync_lock(&A->WriteQueueLock, 100);
+
 	int ret = io_submit(A->ctx, A->IOCount, A->IOList);
 	A->IOCount = 0;
 
@@ -154,6 +186,9 @@ int  fAIO_Kick(fAIO_t* A)
 		printf("io submit failed %i Pending:%i Errno:%i (%s)\n", ret, A->IOPending, errno, strerror(errno));
 		return false;
 	}
+
+	sync_unlock(&A->WriteQueueLock);	
+
 	return true;
 }
 
@@ -184,16 +219,14 @@ int fAIO_Flush(fAIO_t* A)
 // checks system for async io`s that have completed
 int fAIO_Update(fAIO_t* A)
 {
-	if (!A) return 0;
-
 	u64 eval = 0;
 	read(A->afd, &eval, sizeof(eval));
 
 	if (eval > 0)
 	{
-		u64 TSC = rdtsc();
 		struct timespec tmo;
-		tmo.tv_sec = 0;
+		u64 TSC 	= rdtsc();
+		tmo.tv_sec 	= 0;
 		tmo.tv_nsec = 0;
 
 		int r = io_getevents(A->ctx, 0, 128, A->IOEvent, &tmo);
@@ -254,10 +287,14 @@ bool fAIO_IsOpComplete(fAIO_t* A, fAIOOp_t* Op)
 
 void fAIO_OpClose(fAIO_t* A, fAIOOp_t* Op)
 {
-	Op->NextFree	= A->AIOOpFree;
-	A->AIOOpFree	= Op;
+	sync_lock(&A->WriteQueueLock, 100);
+	{
+		Op->NextFree	= A->AIOOpFree;
+		A->AIOOpFree	= Op;
 
-	Op->State		= AIO_OP_STATE_FREE;
+		Op->State		= AIO_OP_STATE_FREE;
+	}
+	sync_unlock(&A->WriteQueueLock);	
 }
 
 //-----------------------------------------------------------------------------------------------
@@ -307,7 +344,6 @@ s32 fAIO_Write(fAIO_t* A, u8* Buffer, u32 Length)
 		assert(WriteBuffer != NULL);
 
 		fAIOOp_t* Op = fAIO_Queue(A, A->WriteFD, IOCB_CMD_PWRITE, WriteBuffer, A->WriteOffset, kKB(256));	
-		fAIO_Kick(A);
 
 		A->WriteQueue[ QueueIndex ] = Op;
 		A->WriteQueuePut++; 
@@ -328,12 +364,12 @@ s32 fAIO_Write(fAIO_t* A, u8* Buffer, u32 Length)
 }
 
 //-----------------------------------------------------------------------------------------------
+
 void fAIO_WriteUpdate(fAIO_t* A)
 {
 	// nothing to do 
 	if (A->WriteQueuePut == A->WriteQueueGet) return;
-
-	fAIOOp_t* Op = A->WriteQueue[ A->WriteQueueGet & A->WriteQueueMsk ];
+	fAIOOp_t* Op = (fAIOOp_t*)A->WriteQueue[ A->WriteQueueGet & A->WriteQueueMsk ];
 
 	// not completed
 	if (Op->State != AIO_OP_STATE_COMPLETE) return;
@@ -346,29 +382,44 @@ void fAIO_WriteUpdate(fAIO_t* A)
 }
 
 //-----------------------------------------------------------------------------------------------
-
+// wait for all ops to complete 
+// called from top level thread, not worker thread 
 void fAIO_WriteFlush(fAIO_t* A)
 {
-	// wait for all ops to complete 
 	while (A->WriteQueueGet != A->WriteQueuePut)
 	{
-		fAIO_Update(A);
-
-		// retire the next 
-		if (A->WriteQueue[ A->WriteQueueGet & A->WriteQueueMsk ] != NULL)
-		{
-			fAIOOp_t* Op = A->WriteQueue[ A->WriteQueueGet & A->WriteQueueMsk ];
-			if (fAIO_IsOpComplete(A, Op))
-			{
-				// free requestor
-				fAIO_OpClose(A, Op);
-
-				// advnace queue
-				A->WriteQueue[ A->WriteQueueGet & A->WriteQueueMsk ] = NULL;
-				A->WriteQueueGet++;
-			}
-		}
+		sleep(0);
+		/*
+		fprintf(stderr, "AIO G:%08x P:%08x (%08x)\n", 	A->WriteQueueGet, 
+														A->WriteQueuePut, 
+														A->WriteQueuePut - A->WriteQueueGet);
+		*/
 	}
+}
+
+//-----------------------------------------------------------------------------------------------
+// IO write thread 
+static void* fAIO_WriteThread(void* User)
+{
+	fAIO_t* A = (fAIO_t*)User;
+
+	fprintf(stderr, "Write Thread start\n");
+	while (!A->IsExit)
+	{
+		if (A->IOCount > 0)
+		{
+			fAIO_Kick(A);
+		}
+
+		fAIO_Update		(A);
+		fAIO_WriteUpdate(A);
+
+		sleep(0);
+	}
+
+	fprintf(stderr, "Write Thread End\n");
+
+	return NULL;
 }
 
 //-----------------------------------------------------------------------------------------------

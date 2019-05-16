@@ -8,6 +8,7 @@
 #include <string.h>
 #include <malloc.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #define IOCB_FLAG_RESFD		(1 << 0)
 
@@ -87,45 +88,49 @@ typedef struct fAIOOp_t
 
 typedef struct fAIO_t 
 {
-	int				afd;
-	aio_context_t 	ctx;
+	int					afd;
+	aio_context_t 		ctx;
 
-	u32 			IOEventMax;
-	io_event_t*		IOEvent;
+	u32 				IOEventMax;
+	io_event_t*			IOEvent;
 
-	u32				AIOOpMax;
-	fAIOOp_t* 		AIOOpList;
+	u32					AIOOpMax;
+	fAIOOp_t* 			AIOOpList;
 
-	fAIOOp_t* 		AIOOpFree;
+	fAIOOp_t* 			AIOOpFree;
 
-	u32				IOCount;
-	u32 			IOListMax;
-	iocb_t**		IOList;
+	u32					IOCount;
+	u32 				IOListMax;
+	iocb_t**			IOList;
 
-	u32				IOPending;
+	u32					IOPending;
 
-	u64				HistoBin;
-	u32				HistoMax;
-	u32*			HistoRd;
-	u32*			HistoWr;
-
+	u64					HistoBin;
+	u32					HistoMax;
+	u32*				HistoRd;
+	u32*				HistoWr;
 
 	// serialized write interface 
-	int 			WriteFD;	
-	u64				WriteOffset;
+	int 				WriteFD;	
+	u64					WriteOffset;
 
 	// IO Write queue
-	u32 			WriteQueuePut;
-	u32 			WriteQueueGet;
-	u32 			WriteQueueMsk;
-	u32 			WriteQueueMax;
-	fAIOOp_t* 		WriteQueue[128];
-	u8*				WriteQueueBuffer[128];
+	u32					WriteQueueLock;
+	volatile u32 		WriteQueuePut;
+	volatile u32 		WriteQueueGet;
+	u32 				WriteQueueMsk;
+	u32 				WriteQueueMax;
+	volatile fAIOOp_t* 	WriteQueue[128];
+	u8*					WriteQueueBuffer[128];
 
-	u32				WritePos;
-	u32				WriteMax;
-	u8*				WriteUnaligned;
-	u8*				Write;
+	// staging buffer
+	u32					WritePos;
+	u32					WriteMax;
+	u8*					WriteUnaligned;
+	u8*					Write;
+
+	volatile bool		IsExit;
+	pthread_t			WriteThread;
 
 } fAIO_t;
 
@@ -233,6 +238,8 @@ static long waitasync(int afd, int timeo)
 //-------------------------------------------------------------------------------
 
 fAIO_t* 	fAIO_Open(int fd);
+void 		fAIO_Close(fAIO_t* A);
+
 fAIOOp_t*	fAIO_Queue(fAIO_t* A, int fd, u32 FileOp, void* Buffer, u64 Offset, u64 SectorSize);
 int  		fAIO_Kick(fAIO_t* A);
 int 		fAIO_Update(fAIO_t* A);
@@ -243,6 +250,7 @@ void 		fAIO_DumpHisto(fAIO_t*A);
 u64 		fAIO_LatencyMax(fAIO_t*A);
 u64 		fAIO_LatencyMid(fAIO_t*A);
 void 		fAIO_HistoReset(fAIO_t*A);
+
 
 s32 		fAIO_Write(fAIO_t* A, u8* Buffer, u32 Length);
 void 		fAIO_WriteUpdate(fAIO_t* a);
