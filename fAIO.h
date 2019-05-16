@@ -120,8 +120,8 @@ typedef struct fAIO_t
 	volatile u32 		WriteQueueGet;
 	u32 				WriteQueueMsk;
 	u32 				WriteQueueMax;
-	volatile fAIOOp_t* 	WriteQueue[128];
-	u8*					WriteQueueBuffer[128];
+	volatile fAIOOp_t* 	WriteQueue[1024];
+	u8*					WriteQueueBuffer[1024];
 
 	// staging buffer
 	u32					WritePos;

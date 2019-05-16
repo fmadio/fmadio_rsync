@@ -176,18 +176,26 @@ fAIOOp_t* fAIO_Queue(fAIO_t* A, int fd, u32 FileOp, void* Buffer, u64 Offset, u6
 
 int  fAIO_Kick(fAIO_t* A)
 {
+	u32					IOCount;
+	static iocb_t*		IOList[1024*1024];
+
+	// make copy of the IO list to submit
 	sync_lock(&A->WriteQueueLock, 100);
+	{
+		IOCount 	= A->IOCount;
+		memcpy(IOList, A->IOList, A->IOCount * sizeof(iocb_t*) );
 
-	int ret = io_submit(A->ctx, A->IOCount, A->IOList);
-	A->IOCount = 0;
+		A->IOCount = 0;
+	}
+	sync_unlock(&A->WriteQueueLock);	
 
+	// io_submit takes a long time, so dont block the queue process
+	int ret = io_submit(A->ctx, IOCount, IOList);
 	if (ret < 0)
 	{
 		printf("io submit failed %i Pending:%i Errno:%i (%s)\n", ret, A->IOPending, errno, strerror(errno));
 		return false;
 	}
-
-	sync_unlock(&A->WriteQueueLock);	
 
 	return true;
 }
