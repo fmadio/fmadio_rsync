@@ -173,6 +173,7 @@ static volatile u32			s_EOFSeqNo 		= 0;		// indicates SeqNo for EOF
 
 u32							g_Quiet 		= false;	// quiet mode 
 
+static bool					s_OutputNULL	= false;	// output NULL. used for benchmarking 
 static bool					s_OutputAIO		= false;	// output via AIO
 static bool					s_OutputStdout 	= true;		// output on stdout
 static u8					s_OutputFileName[256];		// where to write the file
@@ -222,6 +223,11 @@ static void File_Open(u64 MaxSize)
 // write data out
 static void File_Write(u8* Data, u32 Length)
 {
+	if (s_OutputNULL)
+	{
+		return;
+	}
+
 	if (s_OutputStdout)
 	{
 		int wlen = fwrite(Data, 1, Length, stdout);
@@ -1041,7 +1047,7 @@ int main(int argc, char* argv[])
 			s_OutputStdout = true;
 			fprintf(stderr, "OutputMode stdout\n");
 		}
-		// output stdout 
+		// write at high speed to a local file 
 		else if (strcmp(argv[i], "--output-file") == 0)
 		{
 			strncpy(s_OutputFileName, argv[i+1], sizeof(s_OutputFileName) );
@@ -1049,6 +1055,14 @@ int main(int argc, char* argv[])
 			i += 1;
 
 			s_OutputAIO 	= true;
+			s_OutputStdout 	= false;
+		}
+		// output null. used for benchmarking 
+		else if (strcmp(argv[i], "--output-null") == 0)
+		{
+			fprintf(stderr, "OutputMode NULL\n");
+
+			s_OutputNULL 	= true;
 			s_OutputStdout 	= false;
 		}
 		// list all the captures 
